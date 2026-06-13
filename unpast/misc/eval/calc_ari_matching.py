@@ -216,7 +216,7 @@ def _adjust_pvals_df(
     if adjust_pvals == "B":
         # Bonferroni across each row/entry: multiply p-values by number of tests (columns)
         pvals = pvals * pvals.shape[0]
-        pvals = pvals.applymap(lambda x: min(x, 1))
+        pvals = pvals.apply(lambda col: col.map(lambda x: min(x, 1)))
         return pvals
     elif adjust_pvals == "BH":
         return _apply_bh(pvals, a=pval_cutoff)

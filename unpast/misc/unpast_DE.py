@@ -285,6 +285,8 @@ def run_de_for_unpast(
     de_df = new_unpast_df.loc[:, cols]
     cols = ["genes", "genes_DE", "genes_up_DE", "genes_down_DE"]
     de_df.loc[:, cols] = (
-        de_df.loc[:, cols].fillna("").applymap(lambda row: set(row.split(" ")))
+        de_df.loc[:, cols]
+        .fillna("")
+        .apply(lambda col: col.map(lambda row: set(row.split(" "))))
     )
     return de_df

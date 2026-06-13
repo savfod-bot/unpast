@@ -123,11 +123,15 @@ def draw_heatmap2(
         bic_ids = biclusters.loc[biclusters["direction"] == "UP", :].index.values
         bic_ids = [bic_prefix + str(bic_id) for bic_id in bic_ids]
         d = {"black": "red", "white": "blue"}
-        col_colors.loc[:, bic_ids] = col_colors.loc[:, bic_ids].applymap(lambda x: d[x])
+        col_colors.loc[:, bic_ids] = col_colors.loc[:, bic_ids].apply(
+            lambda col: col.map(lambda x: d[x])
+        )
         bic_ids = biclusters.loc[biclusters["direction"] == "DOWN", :].index.values
         bic_ids = [bic_prefix + str(bic_id) for bic_id in bic_ids]
         d = {"black": "blue", "white": "red"}
-        col_colors.loc[:, bic_ids] = col_colors.loc[:, bic_ids].applymap(lambda x: d[x])
+        col_colors.loc[:, bic_ids] = col_colors.loc[:, bic_ids].apply(
+            lambda col: col.map(lambda x: d[x])
+        )
 
     if no_bic_columns:
         col_colors = col_colors.loc[:, cols]
