@@ -289,7 +289,7 @@ def unpast(
     if "WGCNA" in clust_method:
         modularity, similarity_cutoff = None, None
     elif clust_method == "Louvain" or clust_method == "Leiden":
-        ds, dhs = None, None
+        ds, dch = None, None
     write_bic_table(
         biclusters,
         results_file_name=paths.res,
