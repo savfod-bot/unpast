@@ -26,7 +26,7 @@ def cluster_samples(data, min_n_samples=5, seed=0, method="kmeans"):
     """
     # identify identify bicluster and backgound groups using 2-means
     max_n_iter = max(max(data.shape), 500)
-    if method in ["kmeans", "jenks"]:
+    if method in ["kmeans", "jenks", "jenks_qda"]:
         labels = (
             KMeans(
                 n_clusters=2,

@@ -92,6 +92,73 @@ def _min_intraclass_variance_split(data):
     return data >= thresh
 
 
+def _gaussian_boundary(m1, v1, w1, m2, v2, w2):
+    """Decision boundary between two 1-D Gaussians with their own variances/weights.
+
+    Solves w1*N(x; m1, v1) == w2*N(x; m2, v2) for x. With unequal variances this
+    is a quadratic; the boundary that falls between the two means is returned
+    (None if there is no such root). This is the threshold a 2-component GMM with
+    spherical (per-component) variance would use, computed in closed form.
+    """
+    eps = 1e-12
+    v1 = max(float(v1), eps)
+    v2 = max(float(v2), eps)
+    k = np.log(w1) - np.log(w2) - 0.5 * np.log(v1) + 0.5 * np.log(v2)
+    a = 0.5 * (1.0 / v1 - 1.0 / v2)
+    b = m2 / v2 - m1 / v1
+    c = m1 * m1 / (2 * v1) - m2 * m2 / (2 * v2) - k
+    lo, hi = (m1, m2) if m1 < m2 else (m2, m1)
+    if abs(a) < eps:  # equal variances -> linear
+        if abs(b) < eps:
+            return None
+        x = -c / b
+        return x if lo < x < hi else None
+    disc = b * b - 4 * a * c
+    if disc < 0:
+        return None
+    sq = np.sqrt(disc)
+    roots = [(-b + sq) / (2 * a), (-b - sq) / (2 * a)]
+    cands = [r for r in roots if lo < r < hi]
+    if not cands:
+        return None
+    mid = 0.5 * (lo + hi)
+    return min(cands, key=lambda r: abs(r - mid))
+
+
+def _qda_threshold_split(row, n_iter=5):
+    """Fast variance-aware binarization split.
+
+    Initialise from the cheap min-intraclass-variance (jenks) split, then refine
+    the threshold with the closed-form 2-Gaussian (QDA) boundary, re-estimating
+    each group's (mean, variance, weight) and recomputing the boundary until the
+    labels stop changing (a deterministic hard-assignment mini-EM, usually 2-3
+    iterations). This captures the asymmetric small-vs-wide split that makes full
+    GMM work better, at O(n log n) instead of per-feature EM. Falls back to the
+    jenks threshold whenever the refined boundary is degenerate.
+    """
+    labels = _min_intraclass_variance_split(row)
+    if labels.sum() == 0 or (~labels).sum() == 0:
+        return labels
+    n = len(row)
+    for _ in range(n_iter):
+        g_lo, g_hi = row[~labels], row[labels]
+        if len(g_lo) < 2 or len(g_hi) < 2:
+            break
+        thr = _gaussian_boundary(
+            g_lo.mean(), g_lo.var(), len(g_lo) / n,
+            g_hi.mean(), g_hi.var(), len(g_hi) / n,
+        )
+        if thr is None:
+            break
+        new_labels = row >= thr
+        if new_labels.sum() == 0 or (~new_labels).sum() == 0:
+            break
+        if np.array_equal(new_labels, labels):
+            break
+        labels = new_labels
+    return labels
+
+
 def _select_pos_neg(row, min_n_samples, seed=42, prob_cutoff=0.5, method="GMM"):
     """Identify positive and negative signal groups using GMM or other method of binarization.
 
@@ -136,6 +203,11 @@ def _select_pos_neg(row, min_n_samples, seed=42, prob_cutoff=0.5, method="GMM"):
     elif method == "jenks":
         # same result as jenks for 2 classes, but O(n log(n)), not O(n^2 * k)
         labels = _min_intraclass_variance_split(row)
+
+    elif method == "jenks_qda":
+        # jenks split refined once with the closed-form 2-Gaussian boundary:
+        # captures GMM's asymmetric variance-aware threshold at O(n log n)
+        labels = _qda_threshold_split(row)
 
     else:
         raise NotImplementedError(
