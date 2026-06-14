@@ -196,7 +196,7 @@ def sklearn_binarization(
     min_n_samples,
     plot=True,
     plot_SNR_thr=2.0,
-    show_fits=[],
+    show_fits=None,
     seed=1,
     prob_cutoff=0.5,
     method="GMM",
@@ -218,6 +218,8 @@ def sklearn_binarization(
             - binarized_expressions: dict mapping gene names to binary sample groups
             - stats: dict containing SNR and size statistics for each gene
     """
+    if show_fits is None:
+        show_fits = []
     binarized_expressions = {}
     stats = {}
     for i, (gene, row) in enumerate(zip(exprs.index, exprs.to_numpy())):
@@ -461,7 +463,7 @@ def binarize(
     pval=0.001,
     plot_all=True,
     plot_SNR_thr=np.inf,
-    show_fits=[],
+    show_fits=None,
     seed=42,
     prob_cutoff=0.5,
     n_permutations=10000,
@@ -490,6 +492,8 @@ def binarize(
             - stats: DataFrame with binarization statistics (SNR, size, direction)
             - null_distribution: DataFrame containing empirical null distribution for significance testing
     """
+    if show_fits is None:
+        show_fits = []
     args_saveable = _make_saveable_args(locals())
     binarized_data, stats, null_distribution = _try_loading_binarization_files(
         paths, check_args=args_saveable

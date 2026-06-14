@@ -83,9 +83,9 @@ def unpast(
     bin_method: str = "kmeans",
     clust_method: str = "Louvain",
     min_n_samples: int = 5,
-    show_fits: list = [],
+    show_fits: list = None,
     pval: float = 0.01,
-    directions: list = ["DOWN", "UP"],
+    directions: list = None,
     modularity: float = 1 / 3,
     similarity_cutoffs=-1,  # for Louvain
     ds: int = 3,
@@ -133,6 +133,10 @@ def unpast(
     Returns:
         pd.DataFrame: biclusters table with columns for genes, samples, SNR, etc.
     """
+    if show_fits is None:
+        show_fits = []
+    if directions is None:
+        directions = ["DOWN", "UP"]
     np.random.seed(seed)  # todo: check if this is needed
     paths = ProjectPaths(out_dir=out_dir, binary_dir=binary_dir)
 

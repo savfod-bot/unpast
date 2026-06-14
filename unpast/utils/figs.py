@@ -27,7 +27,7 @@ def draw_heatmap2(
     bic_prefix="bic_",
     plot_bg_genes=False,
     no_row_colors=True,
-    highlight_row_labels=[],
+    highlight_row_labels=None,
     row_labels_black=False,
 ):
     """* exprs - expressions of genes to plot
@@ -36,6 +36,8 @@ def draw_heatmap2(
     * color_dict - how to color each label
     * bicluster_colors - color for bicluster annotation "black","auto" or list
     """
+    if highlight_row_labels is None:
+        highlight_row_labels = []
     bic_names = []
     ordered_genes = []
     row_colors = None
