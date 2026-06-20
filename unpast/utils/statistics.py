@@ -6,6 +6,7 @@ import pandas as pd
 import statsmodels.api as sm
 from scipy.interpolate import interp1d
 
+from .backend import to_numpy, xp
 from .logs import get_logger, log_function_duration
 
 logger = get_logger(__name__)
@@ -14,19 +15,24 @@ logger = get_logger(__name__)
 def calc_snr_per_row(s, N, exprs, exprs_sums, exprs_sq_sums):
     """Calculate SNR per row for given bicluster size.
 
+    Backend-agnostic (GPU-ready): all array ops are dispatched through
+    ``xp(exprs)`` so the same code runs on numpy (CPU) or cupy (GPU) arrays
+    without changing the computation order.
+
     Args:
         s (int): bicluster size (number of samples)
         N (int): total number of samples
-        exprs (array): expression matrix
+        exprs (array): expression matrix (numpy or cupy)
         exprs_sums (array): precomputed row sums
         exprs_sq_sums (array): precomputed squared row sums
 
     Returns:
-        array: SNR values per row
+        array: SNR values per row (same backend as ``exprs``)
     """
+    mod = xp(exprs)
     bic = exprs[:, :s]
     bic_sums = bic.sum(axis=1)
-    bic_sq_sums = np.square(bic).sum(axis=1)
+    bic_sq_sums = mod.square(bic).sum(axis=1)
 
     bg_counts = N - s
     bg_sums = exprs_sums - bic_sums
@@ -52,7 +58,7 @@ def calc_mean_std_by_powers(powers):
     count, val_sum, sum_sq = powers
 
     mean = val_sum / count  # what if count == 0?
-    std = np.sqrt((sum_sq / count) - mean * mean)
+    std = xp(val_sum).sqrt((sum_sq / count) - mean * mean)
     return mean, std
 
 
@@ -110,6 +116,11 @@ def generate_null_dist(N, sizes, n_permutations=10000, pval=0.001, seed=42):
     logger.debug(f"- tn_permutations: {n_permutations}")
     logger.debug(f"- snr pval threshold: {pval}")
 
+    # --- Random generation: MUST stay byte-identical to legacy behavior. ---
+    # Randomness is produced on the CPU with numpy's global RNG, with the exact
+    # same seed, draw order, and per-row sort as before. We deliberately do NOT
+    # move this to cupy: cupy's RNG is not bit-compatible with numpy, and any
+    # reordering of draws would change the reference null distribution.
     exprs = np.zeros((n_permutations, N))  # generate random expressions from st.normal
     # values = exprs.values.reshape(-1) # random samples from expression matrix
     # exprs = np.random.choice(values,size=exprs.shape[1])
@@ -117,8 +128,15 @@ def generate_null_dist(N, sizes, n_permutations=10000, pval=0.001, seed=42):
     for i in range(n_permutations):
         exprs[i,] = sorted(np.random.normal(size=N))
 
+    # --- Heavy SNR computation: backend-agnostic (GPU-ready). ---
+    # Once the random matrix exists, the expensive reductions are dispatched
+    # through xp(), so on a GPU box `exprs` can be moved to cupy and the SNR
+    # math runs on device. The per-size loop (rather than a batched reduction)
+    # is kept intentionally so the reduction order is identical to the legacy
+    # numpy path and the reference null distribution stays bit-for-bit the same.
+    exprs = xp(exprs).asarray(exprs)  # numpy -> numpy (CPU) or cupy (GPU)
     exprs_sums = exprs.sum(axis=1)
-    exprs_sq_sums = np.square(exprs).sum(axis=1)
+    exprs_sq_sums = xp(exprs).square(exprs).sum(axis=1)
 
     null_distribution = pd.DataFrame(
         np.zeros((sizes.shape[0], n_permutations)),
@@ -127,8 +145,10 @@ def generate_null_dist(N, sizes, n_permutations=10000, pval=0.001, seed=42):
     )
 
     for s in sizes:
-        null_distribution.loc[s, :] = -1 * calc_snr_per_row(
-            s, N, exprs, exprs_sums, exprs_sq_sums
+        # to_numpy() brings the per-size SNR row back to the host so pandas
+        # (CPU-only) can store it; a no-op when already on numpy.
+        null_distribution.loc[s, :] = -1 * to_numpy(
+            calc_snr_per_row(s, N, exprs, exprs_sums, exprs_sq_sums)
         )
 
     return null_distribution
