@@ -14,6 +14,23 @@ from unpast.utils.logs import get_logger, log_function_duration
 from unpast.utils.statistics import calc_e_pval, calc_SNR, generate_null_dist, get_trend
 from unpast.utils.visualization import plot_binarization_results, plot_binarized_feature
 
+# GPU backend: use cupy when available, fall back to numpy otherwise.
+# On a CPU-only box `_cp` stays None and `_xp(...)` always returns numpy.
+try:
+    import cupy as _cp
+except Exception:
+    _cp = None
+
+
+def _xp(arr):
+    """Return the array module (cupy or numpy) appropriate for ``arr``.
+
+    Lets the same vectorized code run on GPU (cupy arrays) or CPU (numpy
+    arrays) without branching: ``xp = _xp(arr); xp.sort(arr)`` etc.
+    """
+    return _cp.get_array_module(arr) if _cp is not None else np
+
+
 logger = get_logger(__name__)
 
 
@@ -90,6 +107,129 @@ def _min_intraclass_variance_split(data):
     best_split_idx = np.argmin(sums)
     thresh = (sorted_data[best_split_idx] + sorted_data[best_split_idx + 1]) / 2
     return data >= thresh
+
+
+def _min_intraclass_variance_split_batched(exprs):
+    """Batched min-intraclass-variance (jenks for 2 classes) split.
+
+    Vectorized over features: ``exprs`` is a (n_features, n_samples) array (numpy
+    or cupy). For every row at once it sorts along the sample axis, builds the
+    cumulative sums, and picks the split index minimizing ``n1*var1 + n2*var2``.
+    This is the batched, backend-agnostic equivalent of
+    ``_min_intraclass_variance_split`` applied to each row.
+
+    Args:
+        exprs (array): (n_features, n_samples) expression matrix.
+
+    Returns:
+        array: (n_features, n_samples) boolean mask, ``True`` where the original
+            value is ``>=`` the per-row threshold (same convention as the
+            per-feature version).
+    """
+    xp = _xp(exprs)
+    n_features, n_samples = exprs.shape
+
+    if n_samples < 2:
+        return xp.zeros_like(exprs, dtype=bool)
+
+    sorted_data = xp.sort(exprs, axis=1)
+    cumsum = xp.cumsum(sorted_data, axis=1)
+    val_sum = cumsum[:, -1:]  # (n_features, 1)
+    sq_cumsum = xp.cumsum(sorted_data**2, axis=1)
+    sq_sum = sq_cumsum[:, -1:]
+
+    # candidate split sizes for the lower class: 1 .. n_samples-1
+    n1 = xp.arange(1, n_samples)  # (n_samples-1,)
+    n2 = n_samples - n1
+
+    c = cumsum[:, : n_samples - 1]  # cumulative sum of lower class
+    sq = sq_cumsum[:, : n_samples - 1]  # cumulative sq sum of lower class
+
+    # n*var = sum_sq - sum^2/n   for each class
+    sums = (sq - c**2 / n1) + (sq_sum - sq - (val_sum - c) ** 2 / n2)
+    best_split_idx = xp.argmin(sums, axis=1)  # (n_features,)
+
+    rows = xp.arange(n_features)
+    lo = sorted_data[rows, best_split_idx]
+    hi = sorted_data[rows, best_split_idx + 1]
+    thresh = ((lo + hi) / 2)[:, None]  # (n_features, 1)
+    return exprs >= thresh
+
+
+def _jenks_binarization_batched(exprs_df, min_n_samples):
+    """Batched jenks binarization producing per-feature masks and stats.
+
+    Computes, for every feature at once, the min-intraclass-variance split
+    (batched, xp-based) and then applies the SAME post-processing as
+    ``_select_pos_neg`` (orient smaller group as ``True``, drop samples whose
+    sign differs from the group-median sign, enforce ``min_n_samples``, compute
+    SNR and orient the positive group first).
+
+    The split itself is fully vectorized; the post-processing is done with a
+    per-row loop over the already-computed label matrix to keep the tricky
+    sign/median/SNR rules byte-for-byte identical to the scalar path. SNR uses
+    ``calc_SNR`` (numpy mean / nanstd ddof=0), matching ``_select_pos_neg``.
+
+    Args:
+        exprs_df (DataFrame): expression matrix, features (rows) x samples (cols).
+        min_n_samples (int): minimum samples required in the smaller group.
+
+    Returns:
+        tuple: (pos_masks, neg_masks, snrs, sizes) where pos/neg masks are
+            (n_features, n_samples) numpy bool arrays and snrs/sizes are
+            length-n_features numpy arrays (np.nan where the feature fails the
+            min_n_samples filter).
+    """
+    exprs = exprs_df.to_numpy()
+    xp = _xp(exprs)
+
+    labels_mat = _min_intraclass_variance_split_batched(exprs)
+
+    # bring back to numpy/host for the per-row post-processing (no-op on CPU;
+    # the heavy split above is what the GPU accelerates)
+    if _cp is not None and xp is _cp:
+        labels_mat = _cp.asnumpy(labels_mat)
+
+    n_features, n_samples = exprs.shape
+    pos_masks = np.zeros((n_features, n_samples), dtype=bool)
+    neg_masks = np.zeros((n_features, n_samples), dtype=bool)
+    snrs = np.full(n_features, np.nan)
+    sizes = np.full(n_features, np.nan)
+
+    for i in range(n_features):
+        row = exprs[i]
+        labels = labels_mat[i].copy()
+
+        # let labels == True be always a smaller sample set
+        if labels.sum() >= (~labels).sum():
+            labels = ~labels
+
+        # remove from bicluster samples with the sign different from median sign
+        if labels.sum() > 0:
+            pos = (row[labels] >= 0).sum()
+            neg = (row[labels] < 0).sum()
+            if pos > neg:
+                labels[row < 0] = False
+            elif pos == neg:
+                if np.median(row[labels]) >= 0:
+                    labels[row < 0] = False
+                else:
+                    labels[row >= 0] = False
+            else:
+                labels[row >= 0] = False
+
+        if labels.sum() >= min_n_samples:
+            size = labels.sum()
+            snr = calc_SNR(row[labels], row[~labels])
+            if snr <= 0:
+                labels = ~labels
+            pos_masks[i] = labels
+            neg_masks[i] = ~labels
+            snrs[i] = abs(snr)
+            sizes[i] = size
+        # else: leave masks empty, snr/size as nan
+
+    return pos_masks, neg_masks, snrs, sizes
 
 
 def _select_pos_neg(row, min_n_samples, seed=42, prob_cutoff=0.5, method="GMM"):
@@ -220,10 +360,26 @@ def sklearn_binarization(
     """
     binarized_expressions = {}
     stats = {}
-    for i, (gene, row) in enumerate(zip(exprs.index, exprs.to_numpy())):
-        pos_mask, neg_mask, snr, size, is_converged = _select_pos_neg(
-            row, min_n_samples, seed=seed, prob_cutoff=prob_cutoff, method=method
+
+    # batched (backend-agnostic) jenks path: compute the split + post-processing
+    # for all features at once. Other methods stay on the per-feature path.
+    batched_jenks = method == "jenks"
+    if batched_jenks:
+        _pos_b, _neg_b, _snr_b, _size_b = _jenks_binarization_batched(
+            exprs, min_n_samples
         )
+
+    for i, (gene, row) in enumerate(zip(exprs.index, exprs.to_numpy())):
+        if batched_jenks:
+            pos_mask = _pos_b[i]
+            neg_mask = _neg_b[i]
+            snr = _snr_b[i]
+            size = _size_b[i]
+            is_converged = None
+        else:
+            pos_mask, neg_mask, snr, size, is_converged = _select_pos_neg(
+                row, min_n_samples, seed=seed, prob_cutoff=prob_cutoff, method=method
+            )
 
         # bicluster is the smaller part
         if pos_mask.sum() <= neg_mask.sum():
