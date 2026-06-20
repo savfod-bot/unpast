@@ -15,20 +15,12 @@ from unpast.utils.statistics import calc_e_pval, calc_SNR, generate_null_dist, g
 from unpast.utils.visualization import plot_binarization_results, plot_binarized_feature
 
 # GPU backend: use cupy when available, fall back to numpy otherwise.
-# On a CPU-only box `_cp` stays None and `_xp(...)` always returns numpy.
-try:
-    import cupy as _cp
-except Exception:
-    _cp = None
+# Helpers live in unpast.utils.backend; `_xp`/`_cp` kept as local aliases so
+# existing call sites in this module are unchanged.
+from unpast.utils.backend import get_cupy as _get_cupy
+from unpast.utils.backend import xp as _xp
 
-
-def _xp(arr):
-    """Return the array module (cupy or numpy) appropriate for ``arr``.
-
-    Lets the same vectorized code run on GPU (cupy arrays) or CPU (numpy
-    arrays) without branching: ``xp = _xp(arr); xp.sort(arr)`` etc.
-    """
-    return _cp.get_array_module(arr) if _cp is not None else np
+_cp = _get_cupy()
 
 
 logger = get_logger(__name__)

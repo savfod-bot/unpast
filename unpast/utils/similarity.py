@@ -3,6 +3,8 @@
 import numpy as np
 import pandas as pd
 
+from unpast.utils.backend import to_numpy as _to_numpy
+from unpast.utils.backend import xp as _xp
 from unpast.utils.logs import get_logger, log_function_duration
 
 logger = get_logger(__name__)
@@ -23,7 +25,11 @@ def get_similarity_ari(binarized_data: pd.DataFrame) -> pd.DataFrame:
         Symmetric similarity matrix with ARI values in [-1, 1].
         Diagonal entries are 1.0.
     """
-    X = binarized_data.to_numpy(dtype=int)
+    # Backend-agnostic: runs on numpy (CPU) or cupy (GPU). On a CPU-only box
+    # `xp` is numpy. The matmul `X.T @ X` is the O(features^2) hot path.
+    X_np = binarized_data.to_numpy(dtype=int)
+    xp = _xp(X_np)
+    X = xp.asarray(X_np)
     n_samples = X.shape[0]
 
     # Contingency table components for all feature pairs
@@ -50,9 +56,11 @@ def get_similarity_ari(binarized_data: pd.DataFrame) -> pd.DataFrame:
         # if denominator is 0, set ARI to 1.0 (perfect match)
         # (not expected to happen from the binarization step)
         # using 0.1 threshold to avoid floating point issues
-        ari = np.where(np.abs(denominator) > 0.1, numerator / denominator, 1.0)
+        ari = xp.where(xp.abs(denominator) > 0.1, numerator / denominator, 1.0)
 
     ari = ari.clip(-1.0, 1.0)  # Ensure valid range in case of floating point errors
+    # Convert back to numpy at the boundary for pandas / downstream CPU code.
+    ari = _to_numpy(ari)
     ari_df = pd.DataFrame(
         ari, index=binarized_data.columns, columns=binarized_data.columns
     )
@@ -78,34 +86,54 @@ def get_similarity_jaccard(binarized_data):  # ,J=0.5
     size_threshold = int(min(0.45 * n_samples, (n_samples) / 2 - 10))
     # print("size threshold",size_threshold)
     n_genes = binarized_data.shape[1]
-    df = np.array(binarized_data.T, dtype=bool)
-    results = np.zeros((n_genes, n_genes))
-    for i in range(0, n_genes):
-        results[i, i] = 1
-        g1 = df[i]
 
-        for j in range(i + 1, n_genes):
-            g2 = df[j]
-            o = g1 * g2
-            u = g1 + g2
-            jaccard = o.sum() / u.sum()
-            # try matching complements
-            if g1.sum() > size_threshold:
-                g1_complement = ~g1
-                o = g1_complement * g2
-                u = g1_complement + g2
-                jaccard_c = o.sum() / u.sum()
-            elif g2.sum() > size_threshold:
-                g2 = ~g2
-                o = g1 * g2
-                u = g1 + g2
-                jaccard_c = o.sum() / u.sum()
-            else:
-                jaccard_c = 0
-            jaccard = max(jaccard, jaccard_c)
-            results[i, j] = jaccard
-            results[j, i] = jaccard
+    # Backend-agnostic + matmul-vectorized. Runs on numpy (CPU) or cupy (GPU);
+    # on a CPU-only box `xp` is numpy. The intersection matmul B @ B.T is the
+    # O(features^2) hot path. Membership matrix B: features (rows) x samples.
+    B_np = np.asarray(binarized_data.T, dtype=np.float64)
+    xp = _xp(B_np)
+    B = xp.asarray(B_np)
 
+    rowsum = B.sum(axis=1)  # |g_i|, per feature
+    inter = B @ B.T  # |g_i & g_j|
+    union = rowsum[:, None] + rowsum[None, :] - inter  # |g_i | g_j|
+
+    # Complement-matching variants (mirror the original elif logic):
+    #   ~g1 & g2  -> |g2| - inter ;  |~g1 | g2| = n - |g1| + inter
+    #   g1 & ~g2  -> |g1| - inter ;  |g1 | ~g2| = n - |g2| + inter
+    union_c1 = n_samples - rowsum[:, None] + inter
+    union_c2 = n_samples - rowsum[None, :] + inter
+
+    # Divide only where the union (denominator) is non-empty; a 0/0 ratio in the
+    # original collapses to 0 via max(jaccard, jaccard_c) anyway (both features
+    # empty in that union -> no overlap), so map empty-union cells to 0.
+    def _safe_div(num, den):
+        return xp.where(den > 0, num / xp.where(den > 0, den, 1.0), 0.0)
+
+    jaccard = _safe_div(inter, union)
+    jac_c1 = _safe_div(rowsum[None, :] - inter, union_c1)
+    jac_c2 = _safe_div(rowsum[:, None] - inter, union_c2)
+
+    # Select complement variant per the original (asymmetric) elif rule. The
+    # original loop fixes g1 = lower-indexed feature, g2 = higher-indexed, and
+    # mirrors the result, so the complement preference goes to the smaller index
+    # when both features exceed the threshold:
+    #   if |g_row| > threshold: use jac_c1 (complement of the row feature)
+    #   elif |g_col| > threshold: use jac_c2 (complement of the col feature)
+    #   else: 0
+    # Computed on the upper triangle (row < col), then symmetrized.
+    big_i = rowsum[:, None] > size_threshold
+    big_j = rowsum[None, :] > size_threshold
+    jaccard_c = xp.where(big_i, jac_c1, xp.where(big_j, jac_c2, 0.0))
+
+    upper = xp.maximum(jaccard, jaccard_c)
+    upper = xp.triu(upper, k=1)  # keep strict upper triangle (row < col)
+    results = upper + upper.T  # symmetric, zero diagonal
+    # Diagonal is exactly 1 (a feature vs itself), as in the original.
+    xp.fill_diagonal(results, 1.0)
+
+    # Convert back to numpy at the boundary for pandas / downstream CPU code.
+    results = _to_numpy(results)
     results = pd.DataFrame(data=results, index=genes, columns=genes)
     logger.debug(
         f"Jaccard similarities for {binarized_data.shape[1]} features computed."
